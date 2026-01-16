@@ -8,6 +8,7 @@ import subprocess
 import threading
 from pathlib import Path
 import gradio as gr
+from gradio import ChatMessage
 
 # Endpoint configurations
 ENDPOINTS = {
@@ -99,7 +100,7 @@ CUSTOM_CSS = """
 
 
 def format_chat_display(history):
-    """Convert chat_history to Gradio Chatbot format."""
+    """Convert chat_history to Gradio Chatbot messages format."""
     if not history:
         return []
 
@@ -109,12 +110,12 @@ def format_chat_display(history):
         content = msg["content"]
 
         if role == "system":
-            # System messages shown as a note
-            chatbot_messages.append((None, f"[System] {content}"))
+            # System messages shown as assistant note
+            chatbot_messages.append(ChatMessage(role="assistant", content=f"[System] {content}"))
         elif role == "user":
-            chatbot_messages.append((content, None))
+            chatbot_messages.append(ChatMessage(role="user", content=content))
         elif role == "assistant":
-            chatbot_messages.append((None, content))
+            chatbot_messages.append(ChatMessage(role="assistant", content=content))
 
     return chatbot_messages
 
@@ -138,7 +139,7 @@ def build_payload(history, focus_idx, temperature, max_tokens, top_p, model="unk
 def get_nav_choices(history):
     """Generate dropdown choices for message navigation."""
     if not history:
-        return ["(empty)"]
+        return gr.update(choices=["(empty)"], value="(empty)")
 
     choices = []
     for i, msg in enumerate(history):
@@ -146,7 +147,8 @@ def get_nav_choices(history):
         preview = msg["content"][:30] + "..." if len(msg["content"]) > 30 else msg["content"]
         preview = preview.replace("\n", " ")
         choices.append(f"[{i}] {role}: {preview}")
-    return choices
+    # Set value to the last item
+    return gr.update(choices=choices, value=choices[-1] if choices else "(empty)")
 
 
 def send_message(history, focus_idx, system_text, user_text, temperature, max_tokens, top_p,
@@ -254,14 +256,18 @@ def navigate_next(history, focus_idx, temperature, max_tokens, top_p):
 
 def navigate_to_selection(history, selection, temperature, max_tokens, top_p):
     """Navigate to selected message from dropdown."""
+    # Handle list input (Gradio sometimes passes a list)
+    if isinstance(selection, list):
+        selection = selection[0] if selection else None
+
     if not history or not selection or selection == "(empty)":
         return load_message_at_index(history, -1, temperature, max_tokens, top_p)
 
     # Extract index from selection string "[0] role: preview"
     try:
-        idx = int(selection.split("]")[0].replace("[", ""))
+        idx = int(str(selection).split("]")[0].replace("[", ""))
         return load_message_at_index(history, idx, temperature, max_tokens, top_p)
-    except (ValueError, IndexError):
+    except (ValueError, IndexError, AttributeError):
         return load_message_at_index(history, len(history) - 1 if history else -1, temperature, max_tokens, top_p)
 
 
@@ -288,7 +294,7 @@ def load_message_at_index(history, focus_idx, temperature, max_tokens, top_p):
 
 def clear_history():
     """Clear all chat history and reset state."""
-    return ([], -1, [], ["(empty)"], "", "", "", "", "user", "Position: - / 0")
+    return ([], -1, [], gr.update(choices=["(empty)"], value="(empty)"), "", "", "", "", "user", "Position: - / 0")
 
 
 def go_to_end(history, temperature, max_tokens, top_p):
@@ -421,7 +427,8 @@ with gr.Blocks(title="Local OpenAI JSON Playground") as demo:
                     nav_dropdown = gr.Dropdown(
                         choices=["(empty)"],
                         value="(empty)",
-                        label="Select Message"
+                        label="Select Message",
+                        allow_custom_value=True
                     )
                     position_display = gr.Markdown("Position: - / 0")
 
