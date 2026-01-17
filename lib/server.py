@@ -6,10 +6,20 @@ import warnings
 import threading
 import time
 import uuid
+import logging
 from typing import List, Optional
 
-# Suppress flash attention warning on Windows
+# Suppress warnings
 warnings.filterwarnings("ignore", message=".*Torch was not compiled with flash attention.*")
+warnings.filterwarnings("ignore", message=".*flash-attention.*")
+warnings.filterwarnings("ignore", message=".*CUDA extension not installed.*")
+warnings.filterwarnings("ignore", message=".*Exllamav2 kernel.*")
+warnings.filterwarnings("ignore", message=".*CUDA kernels for auto_gptq.*")
+warnings.filterwarnings("ignore", message=".*offload_buffers.*")
+warnings.filterwarnings("ignore", category=UserWarning)
+
+# Suppress auto_gptq logging
+logging.getLogger("auto_gptq").setLevel(logging.ERROR)
 
 import torch
 from fastapi import FastAPI, HTTPException
@@ -131,7 +141,23 @@ class ModelServer:
                     )
                 )
             except Exception as e:
+                import traceback
+                error_details = traceback.format_exc()
+                print(f"Generation error: {error_details}", flush=True)
                 raise HTTPException(status_code=500, detail=str(e))
+
+    def _is_gptq_model(self, model_path: str) -> bool:
+        """Check if the model is a pre-quantized GPTQ model."""
+        import os
+        # Check for GPTQ in folder name or quantize_config.json
+        folder_name = os.path.basename(model_path).lower()
+        if "gptq" in folder_name or "awq" in folder_name:
+            return True
+        # Check for quantize_config.json (GPTQ marker file)
+        config_path = os.path.join(model_path, "quantize_config.json")
+        if os.path.exists(config_path):
+            return True
+        return False
 
     def load_model(self, model_path: str, use_4bit: bool = True, callback=None):
         """Load the model and tokenizer."""
@@ -140,6 +166,11 @@ class ModelServer:
                 callback(msg)
 
         log(f"Model path: {model_path}")
+
+        # Check if this is a pre-quantized GPTQ model
+        is_gptq = self._is_gptq_model(model_path)
+        if is_gptq:
+            log("Detected pre-quantized GPTQ model")
 
         # Detect device
         if torch.cuda.is_available():
@@ -159,10 +190,48 @@ class ModelServer:
         )
         log("Tokenizer loaded.")
 
-        # Load model
-        if device == "cuda" and use_4bit:
-            if callback:
-                callback("Loading with 4-bit quantization...")
+        # Load model based on type
+        if is_gptq:
+            # GPTQ models - use auto_gptq directly
+            log("Loading GPTQ model (pre-quantized 4-bit)...")
+            try:
+                # Suppress auto_gptq warnings
+                import sys
+                import io
+                old_stderr = sys.stderr
+                sys.stderr = io.StringIO()
+
+                from auto_gptq import AutoGPTQForCausalLM
+                self.model = AutoGPTQForCausalLM.from_quantized(
+                    model_path,
+                    device_map="auto",
+                    use_safetensors=True,
+                    trust_remote_code=True
+                )
+                sys.stderr = old_stderr  # Restore stderr
+                mode = "GPTQ-4bit"
+            except Exception as e:
+                sys.stderr = old_stderr  # Restore stderr
+                log(f"AutoGPTQ failed: {e}")
+                log("Falling back to float16 loading (model may be unsupported by GPTQ)...")
+                # Fallback: load as regular float16 model, ignoring GPTQ config
+                from transformers import AutoConfig
+                config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+                # Remove quantization config to prevent GPTQ loading
+                if hasattr(config, 'quantization_config'):
+                    delattr(config, 'quantization_config')
+                self.model = AutoModelForCausalLM.from_pretrained(
+                    model_path,
+                    config=config,
+                    device_map="auto",
+                    torch_dtype=torch.float16,
+                    trust_remote_code=True,
+                    attn_implementation="eager"
+                )
+                mode = "float16-fallback"
+        elif device == "cuda" and use_4bit:
+            # Runtime quantization with bitsandbytes
+            log("Loading with bitsandbytes 4-bit quantization...")
             quantization_config = BitsAndBytesConfig(
                 load_in_4bit=True,
                 bnb_4bit_compute_dtype=torch.float16,
@@ -175,74 +244,75 @@ class ModelServer:
                 device_map="auto",
                 trust_remote_code=True
             )
+            mode = "bnb-4bit"
         elif device == "cuda":
-            if callback:
-                callback("Loading with full precision (float16)...")
+            log("Loading with full precision (float16)...")
             self.model = AutoModelForCausalLM.from_pretrained(
                 model_path,
                 torch_dtype=torch.float16,
                 device_map="auto",
                 trust_remote_code=True
             )
+            mode = "float16"
         else:
-            if callback:
-                callback("Loading on CPU (float32)...")
+            log("Loading on CPU (float32)...")
             self.model = AutoModelForCausalLM.from_pretrained(
                 model_path,
                 torch_dtype=torch.float32,
                 trust_remote_code=True
             )
             self.model = self.model.to(device)
+            mode = "float32"
 
-        mode = "4-bit" if (device == "cuda" and use_4bit) else "full"
         self.model_name = model_path.split("\\")[-1].split("/")[-1]
 
-        if callback:
-            callback(f"Model loaded: {self.model_name} ({mode})")
+        log(f"Model loaded: {self.model_name} ({mode})")
 
         return True
 
     def _generate(self, messages: List[Message], temperature: float, max_tokens: int, top_p: float) -> tuple:
         """Generate a response from the model."""
-        # Format messages (ChatML format for Qwen)
-        prompt = ""
-        for msg in messages:
-            if msg.role == "system":
-                prompt += f"<|im_start|>system\n{msg.content}<|im_end|>\n"
-            elif msg.role == "user":
-                prompt += f"<|im_start|>user\n{msg.content}<|im_end|>\n"
-            elif msg.role == "assistant":
-                prompt += f"<|im_start|>assistant\n{msg.content}<|im_end|>\n"
+        # Convert messages to list of dicts for apply_chat_template
+        messages_dict = [{"role": msg.role, "content": msg.content} for msg in messages]
 
-        prompt += "<|im_start|>assistant\n"
+        # Use tokenizer's built-in chat template (works for all models)
+        prompt = self.tokenizer.apply_chat_template(
+            messages_dict,
+            tokenize=False,
+            add_generation_prompt=True
+        )
 
         # Tokenize
         inputs = self.tokenizer(prompt, return_tensors="pt")
-        input_ids = inputs.input_ids.to(self.model.device)
-        attention_mask = inputs.attention_mask.to(self.model.device)
+
+        # Get device - handle different model types
+        try:
+            device = self.model.device
+        except AttributeError:
+            # GPTQ models may not have .device, check first parameter
+            device = next(self.model.parameters()).device
+
+        input_ids = inputs.input_ids.to(device)
+        attention_mask = inputs.attention_mask.to(device)
 
         prompt_tokens = input_ids.shape[1]
 
-        # Generate
+        # Generate - use keyword args for compatibility with GPTQ models
         with torch.no_grad():
             outputs = self.model.generate(
-                input_ids,
+                inputs=input_ids,
                 attention_mask=attention_mask,
                 max_new_tokens=max_tokens,
                 temperature=temperature if temperature > 0 else 1.0,
                 top_p=top_p,
                 do_sample=temperature > 0,
-                pad_token_id=self.tokenizer.eos_token_id,
-                eos_token_id=self.tokenizer.convert_tokens_to_ids("<|im_end|>")
+                pad_token_id=self.tokenizer.eos_token_id
             )
 
-        # Decode
+        # Decode only the new tokens
         new_tokens = outputs[0][input_ids.shape[1]:]
         response_text = self.tokenizer.decode(new_tokens, skip_special_tokens=True)
-
         response_text = response_text.strip()
-        if response_text.endswith("<|im_end|>"):
-            response_text = response_text[:-10].strip()
 
         return response_text, prompt_tokens, len(new_tokens)
 

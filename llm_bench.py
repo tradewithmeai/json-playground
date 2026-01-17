@@ -1,8 +1,108 @@
 """
 LLM Benchmark Tool - Unified entry point for model testing and benchmarking.
+
+This script auto-manages its own virtual environment to avoid dependency conflicts.
+On first run, it creates a venv and installs required packages.
 """
 
+import os
 import sys
+import subprocess
+
+# =============================================================================
+# VENV BOOTSTRAP - Must run before any other imports
+# =============================================================================
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+VENV_DIR = os.path.join(SCRIPT_DIR, "venv")
+VENV_PYTHON = os.path.join(VENV_DIR, "Scripts", "python.exe")
+
+# Required packages for the LLM benchmark tool
+REQUIRED_PACKAGES = [
+    "numpy<2",
+    "torch==2.2.2+cu118",
+    "transformers==4.44.2",
+    "accelerate",
+    "bitsandbytes==0.43.1",
+    "auto-gptq==0.7.1",
+    "optimum",
+    "fastapi",
+    "uvicorn",
+    "requests",
+    "pydantic",
+    "protobuf",
+    "sentencepiece",
+]
+
+TORCH_INDEX_URL = "https://download.pytorch.org/whl/cu118"
+
+
+def is_in_venv():
+    """Check if we're running inside our venv."""
+    return sys.executable.lower() == VENV_PYTHON.lower()
+
+
+def create_venv():
+    """Create the virtual environment."""
+    print(f"Creating virtual environment in {VENV_DIR}...")
+    subprocess.run([sys.executable, "-m", "venv", VENV_DIR], check=True)
+    print("Virtual environment created.")
+
+
+def install_packages():
+    """Install required packages in the venv."""
+    print("\nInstalling required packages (this may take several minutes on first run)...")
+
+    # Upgrade pip first
+    subprocess.run([VENV_PYTHON, "-m", "pip", "install", "--upgrade", "pip"],
+                   check=True, capture_output=True)
+
+    # Install torch separately with index URL
+    print("  Installing PyTorch with CUDA support...")
+    subprocess.run([
+        VENV_PYTHON, "-m", "pip", "install",
+        "torch==2.2.2+cu118",
+        "--index-url", TORCH_INDEX_URL
+    ], check=True)
+
+    # Install other packages
+    other_packages = [p for p in REQUIRED_PACKAGES if not p.startswith("torch==")]
+    print("  Installing other dependencies...")
+    subprocess.run([VENV_PYTHON, "-m", "pip", "install"] + other_packages, check=True)
+
+    print("All packages installed.\n")
+
+
+def ensure_venv():
+    """Ensure venv exists and has required packages, then relaunch if needed."""
+    if is_in_venv():
+        # Already in venv, continue with normal execution
+        return
+
+    # Not in venv - need to set up and relaunch
+    print("=" * 60)
+    print("LLM Benchmark Tool - Environment Setup")
+    print("=" * 60)
+
+    venv_exists = os.path.exists(VENV_PYTHON)
+
+    if not venv_exists:
+        create_venv()
+        install_packages()
+
+    # Relaunch script inside the venv
+    print(f"Launching in virtual environment...\n")
+    result = subprocess.run([VENV_PYTHON] + sys.argv)
+    sys.exit(result.returncode)
+
+
+# Run venv check before anything else
+ensure_venv()
+
+# =============================================================================
+# MAIN APPLICATION - Only runs inside venv
+# =============================================================================
+
 import time
 import atexit
 
@@ -11,8 +111,25 @@ from lib.client import run_chat, run_compare
 from lib.utils import check_endpoint, wait_for_server, print_header, print_separator
 
 # Default paths
-DEFAULT_MODEL_PATH = r"C:\ai-models\text-generation-webui\models\Qwen2.5-7B-Instruct"
+MODELS_DIR = r"C:\ai-models\text-generation-webui\models"
 DEFAULT_PORT = 5000
+
+
+def get_available_models():
+    """Scan models directory and return list of available models."""
+    if not os.path.exists(MODELS_DIR):
+        return []
+
+    models = []
+    for name in os.listdir(MODELS_DIR):
+        model_path = os.path.join(MODELS_DIR, name)
+        # Check if it's a directory with model files (safetensors or config.json)
+        if os.path.isdir(model_path):
+            files = os.listdir(model_path)
+            has_model = any(f.endswith('.safetensors') or f == 'config.json' for f in files)
+            if has_model:
+                models.append(name)
+    return sorted(models)
 
 # Global server instance for cleanup
 _server = None
@@ -49,15 +166,38 @@ def mode_local():
     print("LOCAL MODEL SETUP")
     print_separator()
 
-    # Get model path
-    model_path = get_input("Model path", DEFAULT_MODEL_PATH)
+    # List available models
+    models = get_available_models()
+    if not models:
+        print("No models found in:", MODELS_DIR)
+        return
 
-    # Get quantization
-    print("\nQuantization:")
-    print("  [1] 4-bit (recommended for <16GB VRAM)")
-    print("  [2] Full precision (float16)")
-    quant = get_input("Choice", "1")
-    use_4bit = quant != "2"
+    print("\nAvailable models:")
+    for i, name in enumerate(models, 1):
+        print(f"  [{i}] {name}")
+
+    choice = get_input(f"\nSelect model (1-{len(models)})", "1")
+    try:
+        idx = int(choice) - 1
+        if 0 <= idx < len(models):
+            model_name = models[idx]
+            model_path = os.path.join(MODELS_DIR, model_name)
+        else:
+            print("Invalid choice")
+            return
+    except ValueError:
+        print("Invalid choice")
+        return
+
+    # Check if GPTQ model (already quantized)
+    is_gptq = "gptq" in model_name.lower() or "awq" in model_name.lower()
+
+    if is_gptq:
+        print(f"\n{model_name} is pre-quantized (GPTQ 4-bit)")
+    else:
+        print(f"\n{model_name} will load in float16")
+
+    use_4bit = False  # Disabled - bitsandbytes runtime quantization not reliable
 
     # Get port
     port = int(get_input("Port", str(DEFAULT_PORT)))
@@ -141,13 +281,38 @@ def mode_compare():
 
     # First, set up the local model
     print("\n--- LOCAL MODEL (Endpoint A) ---")
-    model_path = get_input("Model path", DEFAULT_MODEL_PATH)
 
-    print("\nQuantization:")
-    print("  [1] 4-bit (recommended)")
-    print("  [2] Full precision")
-    quant = get_input("Choice", "1")
-    use_4bit = quant != "2"
+    # List available models
+    models = get_available_models()
+    if not models:
+        print("No models found in:", MODELS_DIR)
+        return
+
+    print("\nAvailable models:")
+    for i, name in enumerate(models, 1):
+        print(f"  [{i}] {name}")
+
+    choice = get_input(f"\nSelect model (1-{len(models)})", "1")
+    try:
+        idx = int(choice) - 1
+        if 0 <= idx < len(models):
+            model_name = models[idx]
+            model_path = os.path.join(MODELS_DIR, model_name)
+        else:
+            print("Invalid choice")
+            return
+    except ValueError:
+        print("Invalid choice")
+        return
+
+    # Check if GPTQ model
+    is_gptq = "gptq" in model_name.lower() or "awq" in model_name.lower()
+    if is_gptq:
+        print(f"\n{model_name} is pre-quantized (GPTQ 4-bit)")
+    else:
+        print(f"\n{model_name} will load in float16")
+
+    use_4bit = False  # Disabled - bitsandbytes not reliable
 
     port = int(get_input("Local port", str(DEFAULT_PORT)))
 

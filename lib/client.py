@@ -27,8 +27,16 @@ def send_message(url: str, user_input: str, history: list, show_json: bool = Fal
     start = time.perf_counter()
     try:
         response = requests.post(url, json=payload, timeout=300)
-        response.raise_for_status()
         elapsed = time.perf_counter() - start
+
+        if response.status_code != 200:
+            # Get error details from response
+            try:
+                error_data = response.json()
+                error_msg = error_data.get("detail", str(error_data))
+            except:
+                error_msg = response.text[:500] if response.text else f"HTTP {response.status_code}"
+            return None, elapsed, f"Server error: {error_msg}", payload, None
 
         data = response.json()
         reply = data["choices"][0]["message"]["content"]
