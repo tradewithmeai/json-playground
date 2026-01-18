@@ -105,6 +105,8 @@ ensure_venv()
 
 import time
 import atexit
+from dataclasses import dataclass
+from typing import Optional
 
 from lib.server import ModelServer
 from lib.client import run_chat, run_compare
@@ -113,6 +115,44 @@ from lib.utils import check_endpoint, wait_for_server, print_header, print_separ
 # Default paths
 MODELS_DIR = r"C:\ai-models\text-generation-webui\models"
 DEFAULT_PORT = 5000
+
+
+@dataclass
+class AppState:
+    """Centralized application state."""
+    server: Optional[ModelServer] = None
+    local_url: Optional[str] = None
+    local_port: Optional[int] = None
+    model_name: Optional[str] = None
+    cloud_url: Optional[str] = None
+    cloud_name: Optional[str] = None
+    active_mode: Optional[str] = None  # "local", "remote", "compare", "compare_cloud"
+
+    def has_local_server(self) -> bool:
+        return self.server is not None and self.server.is_running()
+
+    def stop_local(self):
+        if self.server and self.server.is_running():
+            print("\nStopping local server...")
+            self.server.stop()
+        self.server = None
+        self.local_url = None
+        self.local_port = None
+        self.model_name = None
+
+    def cleanup(self):
+        self.stop_local()
+        self.cloud_url = None
+        self.cloud_name = None
+        self.active_mode = None
+
+    def status_line(self) -> str:
+        parts = []
+        if self.has_local_server():
+            parts.append(f"Local: {self.model_name} @ :{self.local_port}")
+        if self.cloud_url:
+            parts.append(f"Cloud: {self.cloud_name}")
+        return " | ".join(parts) if parts else "No active connections"
 
 
 def get_available_models():
@@ -131,16 +171,14 @@ def get_available_models():
                 models.append(name)
     return sorted(models)
 
-# Global server instance for cleanup
-_server = None
+# Global application state
+_state = AppState()
 
 
 def cleanup():
     """Cleanup on exit."""
-    global _server
-    if _server and _server.is_running():
-        print("\nShutting down server...")
-        _server.stop()
+    global _state
+    _state.cleanup()
 
 
 atexit.register(cleanup)
@@ -160,7 +198,7 @@ def get_input(prompt: str, default: str = None) -> str:
 
 def mode_local():
     """Mode 1: Start local model server and chat."""
-    global _server
+    global _state
 
     print_separator()
     print("LOCAL MODEL SETUP")
@@ -205,7 +243,7 @@ def mode_local():
     print_separator()
 
     # Create and load model
-    _server = ModelServer()
+    _state.server = ModelServer()
 
     def log(msg):
         print(f"  {msg}", flush=True)
@@ -213,14 +251,15 @@ def mode_local():
     print("Loading model (this may take a few minutes)...", flush=True)
     print("", flush=True)
     try:
-        _server.load_model(model_path, use_4bit=use_4bit, callback=log)
+        _state.server.load_model(model_path, use_4bit=use_4bit, callback=log)
     except Exception as e:
         print(f"\nError loading model: {e}", flush=True)
+        _state.server = None
         return
 
     # Start server
     print("\nStarting server...", flush=True)
-    url = _server.start(port=port)
+    url = _state.server.start(port=port)
     api_url = f"{url}/v1/chat/completions"
 
     # Wait for server to be ready
@@ -229,7 +268,14 @@ def mode_local():
         print("OK")
     else:
         print("FAILED")
+        _state.stop_local()
         return
+
+    # Store state
+    _state.local_url = api_url
+    _state.local_port = port
+    _state.model_name = model_name
+    _state.active_mode = "local"
 
     print_separator()
     print(f"Server ready at {url}")
@@ -249,10 +295,36 @@ def mode_remote():
     print("REMOTE ENDPOINT")
     print_separator()
 
-    url = get_input("API URL", "http://127.0.0.1:5000/v1/chat/completions")
+    # Try to auto-detect running RunPod pod
+    url = None
+    model = "local"  # Default for local servers
+    runpod_url, runpod_model, runpod_err = get_runpod_endpoint()
+
+    if runpod_url:
+        print(f"\nFound running pod: {runpod_model}")
+        print(f"URL: {runpod_url}")
+        use_detected = get_input("Use this endpoint? (y/n)", "y")
+        if use_detected.lower() == "y":
+            url = runpod_url
+            model = runpod_model  # Use actual model name for vLLM
+    else:
+        print(f"\nNo running RunPod detected: {runpod_err}")
+
+    # Fall back to manual entry if no auto-detected endpoint
+    if not url:
+        url = get_input("API URL", "http://127.0.0.1:5000/v1/chat/completions")
+        # For manual entry, ask for model name (local servers ignore this, vLLM needs it)
+        model = get_input("Model name", "local")
+
+    # Get API key from environment
+    api_key = os.environ.get("VLLM_API_KEY")
+    if api_key:
+        print("\nUsing API key from VLLM_API_KEY environment variable")
+    else:
+        print("\nNo VLLM_API_KEY found (requests will be unauthenticated)")
 
     print("\nTesting connection...", end=" ", flush=True)
-    ok, msg = check_endpoint(url)
+    ok, msg = check_endpoint(url, api_key=api_key)
     if ok:
         print("OK")
     else:
@@ -267,12 +339,12 @@ def mode_remote():
     json_view = get_input("Show JSON requests/responses? (y/n)", "n")
     show_json = json_view.lower() == "y"
 
-    run_chat(url, show_json=show_json)
+    run_chat(url, show_json=show_json, api_key=api_key, model=model)
 
 
 def mode_compare():
     """Mode 3: Compare local model vs cloud endpoint."""
-    global _server
+    global _state
 
     print_separator()
     print("COMPARISON MODE: Local vs Cloud")
@@ -318,20 +390,21 @@ def mode_compare():
 
     # Load and start local model
     print_separator()
-    _server = ModelServer()
+    _state.server = ModelServer()
 
     def log(msg):
         print(f"  {msg}")
 
     print("Loading local model...")
     try:
-        _server.load_model(model_path, use_4bit=use_4bit, callback=log)
+        _state.server.load_model(model_path, use_4bit=use_4bit, callback=log)
     except Exception as e:
         print(f"\nError loading model: {e}")
+        _state.server = None
         return
 
     print("\nStarting local server...")
-    local_url = _server.start(port=port)
+    local_url = _state.server.start(port=port)
     local_api = f"{local_url}/v1/chat/completions"
 
     print("Waiting for server...", end=" ", flush=True)
@@ -339,9 +412,15 @@ def mode_compare():
         print("OK")
     else:
         print("FAILED")
+        _state.stop_local()
         return
 
-    local_name = _server.model_name + " (local)"
+    # Store local state
+    _state.local_url = local_api
+    _state.local_port = port
+    _state.model_name = model_name
+
+    local_name = _state.server.model_name + " (local)"
 
     # Now get the cloud endpoint
     print("\n--- CLOUD ENDPOINT (Endpoint B) ---")
@@ -349,6 +428,7 @@ def mode_compare():
     # Try to auto-detect running RunPod pod
     cloud_url = None
     cloud_name = None
+    cloud_model = "local"  # Default model name for API requests
     runpod_url, runpod_model, runpod_err = get_runpod_endpoint()
 
     if runpod_url:
@@ -358,6 +438,7 @@ def mode_compare():
         if use_detected.lower() == "y":
             cloud_url = runpod_url
             cloud_name = runpod_model + " (cloud)"
+            cloud_model = runpod_model  # Use actual model name for vLLM
     else:
         print(f"\nNo running RunPod detected: {runpod_err}")
 
@@ -365,6 +446,7 @@ def mode_compare():
     if not cloud_url:
         cloud_url = get_input("Cloud API URL", "https://your-server.com/v1/chat/completions")
         cloud_name = get_input("Cloud name", "Cloud")
+        cloud_model = get_input("Model name", "local")
 
     # Get API key from environment
     api_key = os.environ.get("VLLM_API_KEY")
@@ -381,7 +463,13 @@ def mode_compare():
         print(f"FAILED ({msg})")
         retry = get_input("Continue anyway? (y/n)", "n")
         if retry.lower() != "y":
+            _state.stop_local()  # Cleanup local server before returning
             return
+
+    # Store cloud state
+    _state.cloud_url = cloud_url
+    _state.cloud_name = cloud_name
+    _state.active_mode = "compare"
 
     print_separator()
     print(f"Ready to compare:")
@@ -395,25 +483,132 @@ def mode_compare():
     json_view = get_input("Show JSON requests/responses? (y/n)", "n")
     show_json = json_view.lower() == "y"
 
-    run_compare(local_api, cloud_url, local_name, cloud_name, show_json=show_json, api_key_b=api_key)
+    run_compare(local_api, cloud_url, local_name, cloud_name, show_json=show_json,
+                api_key_b=api_key, model_a="local", model_b=cloud_model)
 
 
 def main_menu():
-    """Display main menu and get choice."""
+    """Display main menu based on current state."""
     print_header("LLM Benchmark Tool")
+
+    # Show current status
+    print(f"\nStatus: {_state.status_line()}")
     print()
+
     print("  [1] Local Model - Load and serve a local model")
     print("  [2] Remote Endpoint - Connect to existing API")
     print("  [3] Compare - Local model vs cloud endpoint")
-    print("  [4] Exit")
+    print("  [4] Compare Cloud - Compare two remote endpoints")
+
+    if _state.has_local_server():
+        print(f"  [S] Stop Server ({_state.model_name})")
+
+    print("  [Q] Quit")
     print()
 
-    choice = get_input("Choice", "1")
-    return choice
+    return get_input("Choice", "1").upper()
+
+
+def mode_compare_cloud():
+    """Mode 4: Compare two cloud endpoints."""
+    global _state
+
+    print_separator()
+    print("COMPARISON MODE: Cloud vs Cloud")
+    print_separator()
+    print("\nThis mode compares two remote endpoints (no local model needed).")
+
+    # Get first cloud endpoint
+    print("\n--- CLOUD ENDPOINT A ---")
+
+    url_a = None
+    model_a = "local"
+    name_a = None
+    api_key_a = None
+
+    # Try auto-detect for first endpoint
+    runpod_url, runpod_model, runpod_err = get_runpod_endpoint()
+    if runpod_url:
+        print(f"\nFound running pod: {runpod_model}")
+        print(f"URL: {runpod_url}")
+        use_detected = get_input("Use this for Endpoint A? (y/n)", "y")
+        if use_detected.lower() == "y":
+            url_a = runpod_url
+            model_a = runpod_model
+            name_a = runpod_model + " (A)"
+    else:
+        print(f"\nNo running RunPod detected: {runpod_err}")
+
+    if not url_a:
+        url_a = get_input("Endpoint A URL", "https://your-server.com/v1/chat/completions")
+        model_a = get_input("Model name A", "local")
+        name_a = get_input("Display name A", "Cloud-A")
+
+    # Get API key for endpoint A
+    api_key_a = os.environ.get("VLLM_API_KEY")
+    if api_key_a:
+        print("Using VLLM_API_KEY for Endpoint A")
+
+    # Get second cloud endpoint
+    print("\n--- CLOUD ENDPOINT B ---")
+
+    url_b = get_input("Endpoint B URL", "https://other-server.com/v1/chat/completions")
+    model_b = get_input("Model name B", "local")
+    name_b = get_input("Display name B", "Cloud-B")
+
+    # Ask about API key for B (could be different)
+    use_same_key = get_input("Use same API key for Endpoint B? (y/n)", "y")
+    if use_same_key.lower() == "y":
+        api_key_b = api_key_a
+    else:
+        api_key_b = get_input("API key for Endpoint B (or blank)", "")
+        if not api_key_b:
+            api_key_b = None
+
+    # Test connections
+    print(f"\nTesting Endpoint A...", end=" ", flush=True)
+    ok, msg = check_endpoint(url_a, api_key=api_key_a)
+    if ok:
+        print("OK")
+    else:
+        print(f"FAILED ({msg})")
+        retry = get_input("Continue anyway? (y/n)", "n")
+        if retry.lower() != "y":
+            return
+
+    print(f"Testing Endpoint B...", end=" ", flush=True)
+    ok, msg = check_endpoint(url_b, api_key=api_key_b)
+    if ok:
+        print("OK")
+    else:
+        print(f"FAILED ({msg})")
+        retry = get_input("Continue anyway? (y/n)", "n")
+        if retry.lower() != "y":
+            return
+
+    # Store state
+    _state.cloud_url = url_a  # Store first as primary cloud
+    _state.cloud_name = name_a
+    _state.active_mode = "compare_cloud"
+
+    print_separator()
+    print(f"Ready to compare:")
+    print(f"  A: {name_a} @ {url_a}")
+    print(f"  B: {name_b} @ {url_b}")
+    print_separator()
+
+    # Ask about JSON view
+    json_view = get_input("Show JSON requests/responses? (y/n)", "n")
+    show_json = json_view.lower() == "y"
+
+    run_compare(url_a, url_b, name_a, name_b, show_json=show_json,
+                api_key_a=api_key_a, api_key_b=api_key_b, model_a=model_a, model_b=model_b)
 
 
 def main():
     """Main entry point."""
+    global _state
+
     try:
         while True:
             choice = main_menu()
@@ -425,6 +620,15 @@ def main():
             elif choice == "3":
                 mode_compare()
             elif choice == "4":
+                mode_compare_cloud()
+            elif choice == "S":
+                if _state.has_local_server():
+                    _state.stop_local()
+                    print("Server stopped.")
+                else:
+                    print("No server running.")
+                continue  # Don't ask to return to menu
+            elif choice == "Q":
                 print("\nGoodbye!")
                 break
             else:
