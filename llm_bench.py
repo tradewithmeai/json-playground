@@ -108,7 +108,7 @@ import atexit
 
 from lib.server import ModelServer
 from lib.client import run_chat, run_compare
-from lib.utils import check_endpoint, wait_for_server, print_header, print_separator
+from lib.utils import check_endpoint, wait_for_server, print_header, print_separator, get_runpod_endpoint
 
 # Default paths
 MODELS_DIR = r"C:\ai-models\text-generation-webui\models"
@@ -345,11 +345,36 @@ def mode_compare():
 
     # Now get the cloud endpoint
     print("\n--- CLOUD ENDPOINT (Endpoint B) ---")
-    cloud_url = get_input("Cloud API URL", "https://your-server.com/v1/chat/completions")
-    cloud_name = get_input("Cloud name", "Cloud")
+
+    # Try to auto-detect running RunPod pod
+    cloud_url = None
+    cloud_name = None
+    runpod_url, runpod_model, runpod_err = get_runpod_endpoint()
+
+    if runpod_url:
+        print(f"\nFound running pod: {runpod_model}")
+        print(f"URL: {runpod_url}")
+        use_detected = get_input("Use this endpoint? (y/n)", "y")
+        if use_detected.lower() == "y":
+            cloud_url = runpod_url
+            cloud_name = runpod_model + " (cloud)"
+    else:
+        print(f"\nNo running RunPod detected: {runpod_err}")
+
+    # Fall back to manual entry if no auto-detected endpoint
+    if not cloud_url:
+        cloud_url = get_input("Cloud API URL", "https://your-server.com/v1/chat/completions")
+        cloud_name = get_input("Cloud name", "Cloud")
+
+    # Get API key from environment
+    api_key = os.environ.get("VLLM_API_KEY")
+    if api_key:
+        print("\nUsing API key from VLLM_API_KEY environment variable")
+    else:
+        print("\nNo VLLM_API_KEY found (requests will be unauthenticated)")
 
     print(f"\nTesting cloud connection...", end=" ", flush=True)
-    ok, msg = check_endpoint(cloud_url)
+    ok, msg = check_endpoint(cloud_url, api_key=api_key)
     if ok:
         print("OK")
     else:
@@ -362,13 +387,15 @@ def mode_compare():
     print(f"Ready to compare:")
     print(f"  A: {local_name} @ {local_api}")
     print(f"  B: {cloud_name} @ {cloud_url}")
+    if api_key:
+        print(f"  Auth: Bearer token for cloud endpoint")
     print_separator()
 
     # Ask about JSON view
     json_view = get_input("Show JSON requests/responses? (y/n)", "n")
     show_json = json_view.lower() == "y"
 
-    run_compare(local_api, cloud_url, local_name, cloud_name, show_json=show_json)
+    run_compare(local_api, cloud_url, local_name, cloud_name, show_json=show_json, api_key_b=api_key)
 
 
 def main_menu():

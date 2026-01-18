@@ -10,10 +10,17 @@ from concurrent.futures import ThreadPoolExecutor
 MAX_HISTORY = 20  # Keep last 20 messages
 
 
-def send_message(url: str, user_input: str, history: list, show_json: bool = False) -> tuple:
+def send_message(url: str, user_input: str, history: list, show_json: bool = False, api_key: str = None) -> tuple:
     """
     Send message to API and return response with timing.
     Returns (reply, elapsed_time, error, request_json, response_json)
+
+    Args:
+        url: API endpoint URL
+        user_input: User's message
+        history: Conversation history
+        show_json: Whether to show JSON in output
+        api_key: Optional API key for Bearer token auth
     """
     messages = history + [{"role": "user", "content": user_input}]
 
@@ -24,9 +31,13 @@ def send_message(url: str, user_input: str, history: list, show_json: bool = Fal
         "temperature": 0.7
     }
 
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
     start = time.perf_counter()
     try:
-        response = requests.post(url, json=payload, timeout=300)
+        response = requests.post(url, json=payload, headers=headers, timeout=300)
         elapsed = time.perf_counter() - start
 
         if response.status_code != 200:
@@ -119,13 +130,24 @@ def run_chat(url: str, name: str = "Assistant", show_json: bool = False):
         print(f"[{elapsed:.2f}s | {len(history)} msgs]\n")
 
 
-def run_compare(url1: str, url2: str, name1: str = "Model-A", name2: str = "Model-B", show_json: bool = False):
+def run_compare(url1: str, url2: str, name1: str = "Model-A", name2: str = "Model-B",
+                show_json: bool = False, api_key_b: str = None):
     """
     Run comparison chat session with two models.
+
+    Args:
+        url1: First endpoint URL (local)
+        url2: Second endpoint URL (cloud)
+        name1: Display name for first endpoint
+        name2: Display name for second endpoint
+        show_json: Whether to show JSON in output
+        api_key_b: Optional API key for second (cloud) endpoint
     """
     print(f"\nComparison Mode")
     print(f"  {name1}: {url1}")
     print(f"  {name2}: {url2}")
+    if api_key_b:
+        print(f"  Auth: Bearer token for {name2}")
     print(f"Memory: last {MAX_HISTORY} messages (shared)")
     if show_json:
         print("JSON view: ON")
@@ -159,12 +181,12 @@ def run_compare(url1: str, url2: str, name1: str = "Model-A", name2: str = "Mode
         # Run both requests in parallel
         results = {}
 
-        def query_model(name, url):
-            results[name] = send_message(url, user_input, history, show_json)
+        def query_model(name, url, api_key=None):
+            results[name] = send_message(url, user_input, history, show_json, api_key=api_key)
 
         with ThreadPoolExecutor(max_workers=2) as executor:
-            executor.submit(query_model, name1, url1)
-            executor.submit(query_model, name2, url2)
+            executor.submit(query_model, name1, url1, None)
+            executor.submit(query_model, name2, url2, api_key_b)
 
         reply1, time1, err1, req1, res1 = results.get(name1, (None, 0, "No response", None, None))
         reply2, time2, err2, req2, res2 = results.get(name2, (None, 0, "No response", None, None))

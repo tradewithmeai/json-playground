@@ -2,22 +2,69 @@
 Utility functions for LLM Benchmark Tool.
 """
 
+import json
+import os
 import requests
 import time
 
 
-def check_endpoint(url: str, timeout: float = 5.0) -> tuple:
+def get_runpod_endpoint() -> tuple:
     """
-    Check if an endpoint is reachable.
-    Returns (success: bool, message: str)
+    Read RunPod pod state from ~/.myai/pod.json and return endpoint info.
+
+    Returns:
+        (url, model_name, error) - URL and model name if found, or error message
     """
-    # Convert chat completions URL to base URL for health check
-    base_url = url.replace("/v1/chat/completions", "")
+    state_file = os.path.expanduser("~/.myai/pod.json")
+
+    if not os.path.exists(state_file):
+        return None, None, "No pod state file found (~/.myai/pod.json)"
 
     try:
-        response = requests.get(base_url, timeout=timeout)
+        with open(state_file, 'r') as f:
+            state = json.load(f)
+    except json.JSONDecodeError as e:
+        return None, None, f"Invalid JSON in pod state file: {e}"
+    except Exception as e:
+        return None, None, f"Error reading pod state: {e}"
+
+    pod_id = state.get("pod_id")
+    model = state.get("model", "Unknown Model")
+
+    if not pod_id:
+        return None, None, "No pod_id in state file (pod may not be running)"
+
+    # vLLM uses port 8000
+    url = f"https://{pod_id}-8000.proxy.runpod.net/v1/chat/completions"
+    return url, model, None
+
+
+def check_endpoint(url: str, timeout: float = 5.0, api_key: str = None) -> tuple:
+    """
+    Check if an endpoint is reachable.
+
+    Args:
+        url: API endpoint URL
+        timeout: Request timeout in seconds
+        api_key: Optional API key for Bearer token auth
+
+    Returns (success: bool, message: str)
+    """
+    # Use /v1/models endpoint for health check (works with vLLM, OpenAI-compatible servers)
+    health_url = url.replace("/v1/chat/completions", "/v1/models")
+
+    headers = {}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    try:
+        response = requests.get(health_url, timeout=timeout, headers=headers)
         if response.status_code == 200:
             return True, "OK"
+        elif response.status_code == 401:
+            return False, "Unauthorized (check API key)"
+        elif response.status_code == 403:
+            return False, "Forbidden (invalid API key)"
         else:
             return False, f"Status {response.status_code}"
     except requests.exceptions.ConnectionError:
@@ -33,12 +80,12 @@ def wait_for_server(url: str, max_wait: int = 120, interval: float = 2.0) -> boo
     Wait for a server to become ready.
     Returns True if server is ready, False if timeout.
     """
-    base_url = url.replace("/v1/chat/completions", "")
+    health_url = url.replace("/v1/chat/completions", "/v1/models")
     start = time.time()
 
     while time.time() - start < max_wait:
         try:
-            response = requests.get(base_url, timeout=2)
+            response = requests.get(health_url, timeout=2)
             if response.status_code == 200:
                 return True
         except:
